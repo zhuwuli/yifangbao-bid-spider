@@ -1,0 +1,26 @@
+# Local development settings
+.idea/
+.agents/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Build output
+build/
+dist/
+*.spec
+02_源码和说明/build/
+02_源码和说明/dist/
+
+# Local releases and archives
+01_直接使用软件/
+03_归档备份/
+
+# Excel backups and temporary lock files
+*.backup-*.xlsx
+*.backup*.xlsx
+~$*.xlsx
+
+# Logs and temporary files
+*.log
+*.tmp
