@@ -985,7 +985,7 @@ def worksheet_date_sort_key(value: Any) -> tuple[int, int, str]:
     return 99, 99, text
 
 
-def sort_main_sheet_by_date(ws: Any) -> None:
+def expand_date_merges(ws: Any) -> None:
     date_merges = [
         merged
         for merged in list(ws.merged_cells.ranges)
@@ -998,6 +998,24 @@ def sort_main_sheet_by_date(ws: Any) -> None:
         for row in range(min_row, max_row + 1):
             ws.cell(row, 2).value = date_value
 
+
+def merge_equal_date_cells(ws: Any) -> None:
+    if ws.max_row < 2:
+        return
+    group_start = 2
+    current_date = ws.cell(2, 2).value
+    for row in range(3, ws.max_row + 2):
+        date_value = ws.cell(row, 2).value if row <= ws.max_row else None
+        if date_value == current_date:
+            continue
+        if current_date not in (None, "") and row - group_start > 1:
+            ws.merge_cells(start_row=group_start, start_column=2, end_row=row - 1, end_column=2)
+        group_start = row
+        current_date = date_value
+
+
+def sort_main_sheet_by_date(ws: Any) -> None:
+    expand_date_merges(ws)
     data = [
         [ws.cell(row, col).value for col in range(1, ws.max_column + 1)]
         for row in range(2, ws.max_row + 1)
@@ -1009,17 +1027,7 @@ def sort_main_sheet_by_date(ws: Any) -> None:
         for col, value in enumerate(values, start=1):
             ws.cell(target_row, col).value = value
     trim_empty_tail(ws, 3)
-
-    group_start = 2
-    current_date = ws.cell(2, 2).value if ws.max_row >= 2 else None
-    for row in range(3, ws.max_row + 2):
-        date_value = ws.cell(row, 2).value if row <= ws.max_row else None
-        if date_value == current_date:
-            continue
-        if current_date not in (None, "") and row - group_start > 1:
-            ws.merge_cells(start_row=group_start, start_column=2, end_row=row - 1, end_column=2)
-        group_start = row
-        current_date = date_value
+    merge_equal_date_cells(ws)
 
 def create_filtered_workbook(path: Path) -> Path:
     output = filtered_output_path(path)
@@ -1033,6 +1041,7 @@ def create_filtered_workbook(path: Path) -> Path:
     ws = wb.active
     detail_ws = wb[DETAIL_SHEET_NAME] if DETAIL_SHEET_NAME in wb.sheetnames else None
     details = detail_texts_by_title(detail_ws)
+    expand_date_merges(ws)
     deleted_sheet_name = "筛选删除记录"
     if deleted_sheet_name in wb.sheetnames:
         del wb[deleted_sheet_name]
@@ -1070,6 +1079,7 @@ def create_filtered_workbook(path: Path) -> Path:
         trim_empty_tail(detail_ws, 2)
     trim_empty_tail(ws, 3)
     trim_empty_tail(deleted_ws, 3)
+    merge_equal_date_cells(ws)
     for col in range(1, deleted_ws.max_column + 1):
         deleted_ws.column_dimensions[deleted_ws.cell(1, col).column_letter].width = min(60, max(12, len(str(deleted_ws.cell(1, col).value or "")) + 4))
     rebuild_internal_links(wb)
