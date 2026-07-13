@@ -24,3 +24,10 @@ dist/
 # Logs and temporary files
 *.log
 *.tmp
+
+# Browser login data and temporary package builds
+browser_data/
+**/browser_data/
+02_源码和说明/build_*/
+02_源码和说明/dist_*/
+02_源码和说明/spec_*/
