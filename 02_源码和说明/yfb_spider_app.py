@@ -186,8 +186,8 @@ class SpiderApp:
         self.cookie.set(cookie)
         self.status.set("登录状态已保存")
         self.auth_status.set("登录状态可用")
-        self.write_log("[登录] 登录状态已保存，以后可自动复用。\n")
-        messagebox.showinfo("登录成功", "已保存乙方宝登录状态，以后可直接点击“开始爬取”。")
+        self.write_log("[登录] 登录状态已保存，在登录有效期内可自动复用。\n")
+        messagebox.showinfo("登录成功", "已保存并验证乙方宝登录状态，在登录有效期内可直接点击“开始爬取”。")
 
     def choose_xlsx(self) -> None:
         path = filedialog.askopenfilename(

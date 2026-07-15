@@ -45,6 +45,8 @@ SEARCH_TYPES = (1, 2)  # 1=智能检索，2=精准检索；两种都跑，合并
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_XLSX = SCRIPT_DIR / "2026-乙方宝招标信息统计.xlsx"
 DETAIL_SHEET_NAME = "公告详情"
+MAIN_SHEET_NAME = "Sheet1"
+MAIN_HEADERS = ("序号", "日期", "项目名称", "建设单位", "项目位置", "资质", "报名时间", "投标截止时间", "基本情况", "相关性", "备注")
 QUALIFICATION_PLACEHOLDER = "公告资质"
 REMARK_PLACEHOLDER = "备注：未完整获取公告正文或未识别到明确资格要求，请人工核对。公告内容"
 LIST_WORKERS = 3
@@ -796,6 +798,37 @@ def ensure_relevance_column(ws: Any) -> None:
             dst.alignment = copy.copy(src.alignment)
 
 
+def ensure_main_sheet(wb: Any) -> Any:
+    ws = next(
+        (
+            sheet for sheet in wb.worksheets
+            if sheet.title != DETAIL_SHEET_NAME
+            and str(sheet.cell(1, 3).value or "").strip() == "项目名称"
+        ),
+        None,
+    )
+    if ws is None and MAIN_SHEET_NAME in wb.sheetnames:
+        ws = wb[MAIN_SHEET_NAME]
+    if ws is None:
+        ws = next(
+            (
+                sheet for sheet in wb.worksheets
+                if sheet.title != DETAIL_SHEET_NAME
+                and all(sheet.cell(1, col).value in (None, "") for col in range(1, 12))
+            ),
+            None,
+        )
+    if ws is None:
+        ws = wb.create_sheet(MAIN_SHEET_NAME, 0)
+    if str(ws.cell(1, 3).value or "").strip() != "项目名称":
+        for col, header in enumerate(MAIN_HEADERS, start=1):
+            ws.cell(1, col, header)
+            ws.cell(1, col).font = Font(bold=True)
+        ws.freeze_panes = "A2"
+    wb.active = wb.index(ws)
+    return ws
+
+
 def ensure_detail_sheet(wb: Any) -> Any:
     if DETAIL_SHEET_NAME in wb.sheetnames:
         detail_ws = wb[DETAIL_SHEET_NAME]
@@ -811,6 +844,7 @@ def ensure_detail_sheet(wb: Any) -> Any:
         letter = detail_ws.cell(1, column).column_letter
         detail_ws.column_dimensions[letter].width = width
     detail_ws.freeze_panes = "A2"
+    trim_empty_tail(detail_ws, 2)
     return detail_ws
 
 
@@ -924,7 +958,7 @@ def filter_decision(title: str, qualification: str, remark: str, detail_text: st
 
 
 def rebuild_internal_links(wb: Any) -> None:
-    ws = wb.active
+    ws = ensure_main_sheet(wb)
     detail_ws = wb[DETAIL_SHEET_NAME] if DETAIL_SHEET_NAME in wb.sheetnames else None
     for row in range(2, ws.max_row + 1):
         ws.cell(row, 1).value = row - 1
@@ -1038,7 +1072,7 @@ def create_filtered_workbook(path: Path) -> Path:
             raise PermissionError(f"无法覆盖筛选后文件，请先关闭：{output}") from exc
     shutil.copy2(path, output)
     wb = load_workbook(output)
-    ws = wb.active
+    ws = ensure_main_sheet(wb)
     detail_ws = wb[DETAIL_SHEET_NAME] if DETAIL_SHEET_NAME in wb.sheetnames else None
     details = detail_texts_by_title(detail_ws)
     expand_date_merges(ws)
@@ -1095,9 +1129,12 @@ def append_to_workbook(path: Path, rows: list[list[Any]], dry_run: bool) -> None
             create_filtered_workbook(path)
         return
     wb = load_workbook(path)
-    ws = wb.active
+    ws = ensure_main_sheet(wb)
     ensure_relevance_column(ws)
     detail_ws = ensure_detail_sheet(wb)
+    # Expand date merges before deleting trailing rows so a merge cannot be
+    # partially removed and leave openpyxl with stale merged-cell metadata.
+    expand_date_merges(ws)
     while ws.max_row > 2 and all(ws.cell(ws.max_row, c).value in (None, "") for c in range(1, ws.max_column + 1)):
         ws.delete_rows(ws.max_row)
     existing_titles = {

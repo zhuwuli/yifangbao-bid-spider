@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -8,13 +9,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import websocket
 
 
 LOGIN_URL = "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/search"
 AUTH_COOKIE_NAME = "Admin-Token"
+AUTH_CHECK_URL = "https://qiye.qianlima.com/new_qd_yfbsite/api/subZhaobiao/queryZBInfo"
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,62 @@ def has_auth_cookie(cookie_header: str) -> bool:
     return AUTH_COOKIE_NAME in names
 
 
+def _openid_from_cookie(cookie_header: str) -> str:
+    token = next(
+        (
+            part.split("=", 1)[1].strip()
+            for part in cookie_header.split(";")
+            if "=" in part and part.split("=", 1)[0].strip() == AUTH_COOKIE_NAME
+        ),
+        "",
+    )
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(payload).decode("utf-8")).get("ei") or "")
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return ""
+
+
+def validate_auth_cookie(cookie_header: str, timeout: float = 8.0) -> bool:
+    if not has_auth_cookie(cookie_header):
+        return False
+    params = urlencode({
+        "pageSize": 1,
+        "pageNum": 1,
+        "pageFrom": "zhaobiao",
+        "keyword": "监测",
+        "areaIds": "1738,1740",
+        "filterCondition": 2,
+        "searchType": 1,
+        "timeOption": 4,
+        "viewMonitor": "false",
+        "defTimeFlag": 0,
+        "openid": _openid_from_cookie(cookie_header),
+    })
+    request = Request(
+        f"{AUTH_CHECK_URL}?{params}",
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": LOGIN_URL,
+            "Cookie": cookie_header,
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", "ignore"))
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            return False
+        raise RuntimeError(f"验证乙方宝登录状态失败：HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"验证乙方宝登录状态失败：{exc.reason}") from exc
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"验证乙方宝登录状态失败：{exc}") from exc
+    return data.get("code") in (None, 200) and isinstance(data.get("data"), dict)
+
+
 class BrowserSession:
     def __init__(self, browser: BrowserInfo, data_root: Path, headless: bool) -> None:
         if not browser.path.is_file():
@@ -190,7 +250,7 @@ def read_saved_cookie(browser: BrowserInfo, data_root: Path) -> str:
     session = BrowserSession(browser, data_root, headless=True)
     try:
         cookie = session.cookie_header()
-        return cookie if has_auth_cookie(cookie) else ""
+        return cookie if validate_auth_cookie(cookie) else ""
     finally:
         session.close()
 
@@ -203,6 +263,8 @@ def interactive_login(
 ) -> str:
     session = BrowserSession(browser, data_root, headless=False)
     deadline = time.monotonic() + timeout
+    last_checked_cookie = ""
+    stale_status_reported = False
     try:
         if status_callback:
             status_callback("浏览器已打开，请在页面中完成乙方宝登录。")
@@ -210,9 +272,16 @@ def interactive_login(
             if session.process.poll() is not None:
                 raise RuntimeError("登录窗口已关闭，但尚未检测到有效登录状态。")
             cookie = session.cookie_header()
-            if has_auth_cookie(cookie):
+            if has_auth_cookie(cookie) and cookie != last_checked_cookie:
+                last_checked_cookie = cookie
+                if not validate_auth_cookie(cookie):
+                    if status_callback and not stale_status_reported:
+                        status_callback("检测到旧登录记录，但接口验证已失效，请在页面重新登录。")
+                        stale_status_reported = True
+                    time.sleep(1)
+                    continue
                 if status_callback:
-                    status_callback("已检测到登录状态，正在保存。")
+                    status_callback("登录状态已通过接口验证，正在保存。")
                 return cookie
             time.sleep(1)
         raise TimeoutError("等待登录超时，请重新点击“登录乙方宝”。")
