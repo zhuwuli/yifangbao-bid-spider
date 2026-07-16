@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+from openpyxl.worksheet.hyperlink import Hyperlink
 from requests.adapters import HTTPAdapter
 
 
@@ -857,6 +858,13 @@ def short_remark_label(text: str) -> str:
     return "公告备注"
 
 
+def set_internal_hyperlink(cell: Any, location: str, label: str | None = None) -> None:
+    if label is not None:
+        cell.value = label
+    cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
+    cell.style = "Hyperlink"
+
+
 def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kind: str, full_text: str, label: str) -> None:
     full_text = clean_html(full_text)
     if not full_text:
@@ -868,8 +876,7 @@ def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kin
     detail_ws.cell(detail_row, 3, kind)
     detail_ws.cell(detail_row, 4, full_text)
     back_cell = detail_ws.cell(detail_row, 5, "返回主表")
-    back_cell.hyperlink = f"#'{ws.title}'!{main_cell.coordinate}"
-    back_cell.style = "Hyperlink"
+    set_internal_hyperlink(back_cell, f"'{ws.title}'!{main_cell.coordinate}")
     for c in range(1, 6):
         cell = detail_ws.cell(detail_row, c)
         alignment = copy.copy(cell.alignment)
@@ -877,9 +884,7 @@ def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kin
         alignment.vertical = "top"
         cell.alignment = alignment
     detail_ws.row_dimensions[detail_row].height = min(409, max(45, len(full_text) // 80 * 15))
-    main_cell.value = label
-    main_cell.hyperlink = f"#'{DETAIL_SHEET_NAME}'!D{detail_row}"
-    main_cell.style = "Hyperlink"
+    set_internal_hyperlink(main_cell, f"'{DETAIL_SHEET_NAME}'!D{detail_row}", label)
     alignment = copy.copy(main_cell.alignment)
     alignment.wrap_text = True
     alignment.vertical = "top"
@@ -969,27 +974,49 @@ def rebuild_internal_links(wb: Any) -> None:
         for row in range(2, ws.max_row + 1)
         if str(ws.cell(row, 3).value or "").strip()
     }
-    first_qualification_row: dict[str, int] = {}
+    detail_rows: dict[tuple[str, str], int] = {}
     for row in range(2, detail_ws.max_row + 1):
         title = str(detail_ws.cell(row, 2).value or "").strip()
         kind = str(detail_ws.cell(row, 3).value or "").strip()
-        if kind == "资质" and title and title not in first_qualification_row:
-            first_qualification_row[title] = row
+        if title and kind in ("资质", "备注"):
+            detail_rows.setdefault((title, kind), row)
+
     for row in range(2, ws.max_row + 1):
         title = str(ws.cell(row, 3).value or "").strip()
-        cell = ws.cell(row, 6)
-        if title in first_qualification_row:
-            cell.value = QUALIFICATION_PLACEHOLDER
-            cell.hyperlink = f"#'{DETAIL_SHEET_NAME}'!D{first_qualification_row[title]}"
-            cell.style = "Hyperlink"
+        qualification_cell = ws.cell(row, 6)
+        remark_cell = ws.cell(row, 11)
+        qualification_cell.hyperlink = None
+        remark_cell.hyperlink = None
+        qualification_row = detail_rows.get((title, "资质"))
+        if qualification_row:
+            set_internal_hyperlink(
+                qualification_cell,
+                f"'{DETAIL_SHEET_NAME}'!D{qualification_row}",
+                QUALIFICATION_PLACEHOLDER,
+            )
+        remark_row = detail_rows.get((title, "备注"))
+        if remark_row:
+            remark_text = str(detail_ws.cell(remark_row, 4).value or "")
+            set_internal_hyperlink(
+                remark_cell,
+                f"'{DETAIL_SHEET_NAME}'!D{remark_row}",
+                short_remark_label(remark_text),
+            )
+
     for row in range(2, detail_ws.max_row + 1):
         title = str(detail_ws.cell(row, 2).value or "").strip()
+        kind = str(detail_ws.cell(row, 3).value or "").strip()
         main_row = main_rows.get(title)
+        back_cell = detail_ws.cell(row, 5)
+        back_cell.hyperlink = None
         if main_row:
             detail_ws.cell(row, 1).value = ws.cell(main_row, 1).value
-            back_cell = detail_ws.cell(row, 5, "返回主表")
-            back_cell.hyperlink = f"#'{ws.title}'!F{main_row}"
-            back_cell.style = "Hyperlink"
+            main_col = 11 if kind == "备注" else 6
+            set_internal_hyperlink(
+                back_cell,
+                f"'{ws.title}'!{ws.cell(main_row, main_col).coordinate}",
+                "返回主表",
+            )
 
 
 def trim_empty_tail(ws: Any, title_col: int) -> None:
