@@ -36,6 +36,7 @@ class SpiderApp:
         self.xlsx = StringVar(value=str(DEFAULT_XLSX))
         self.days = IntVar(value=31)
         self.dry_run = BooleanVar(value=False)
+        self.download_pdf = BooleanVar(value=True)
         self.process: subprocess.Popen[str] | None = None
         self.running_in_process = False
         self.browser_options: dict[str, BrowserInfo] = {}
@@ -83,13 +84,14 @@ class SpiderApp:
         ttk.Label(outer, text="当前规则").grid(row=4, column=0, sticky="nw", padx=(0, 10), pady=6)
         rule_text = (
             "地区：山东济南、莱芜；关键词：监测、水土保持、测绘、测量、绿色建筑评价、绿色建筑验收；"
-            "输出：原始表 + 筛选后表；标题命中保留，标题未命中再按公告资质规则筛选。"
+            "输出：原始表 + 筛选后表；项目名称链接详情页；筛选后新增公告按运行日期归档 PDF。"
         )
         ttk.Label(outer, text=rule_text, wraplength=740).grid(row=4, column=1, columnspan=3, sticky="w", pady=6)
 
         options = ttk.Frame(outer)
         options.grid(row=5, column=1, columnspan=3, sticky="w", pady=6)
         ttk.Checkbutton(options, text="演练模式，不写入 Excel", variable=self.dry_run).pack(side="left")
+        ttk.Checkbutton(options, text="自动下载筛选后新增公告 PDF", variable=self.download_pdf).pack(side="left", padx=(18, 0))
 
         actions = ttk.Frame(outer)
         actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 10))
@@ -99,6 +101,7 @@ class SpiderApp:
         self.stop_button.pack(side="left", padx=8)
         ttk.Button(actions, text="清空日志", command=self.clear_log).pack(side="left", padx=8)
         ttk.Button(actions, text="打开说明书", command=self.open_manual).pack(side="left", padx=8)
+        ttk.Button(actions, text="打开公告文件夹", command=self.open_notice_folder).pack(side="left", padx=8)
 
         ttk.Label(outer, text="运行日志").grid(row=7, column=0, sticky="nw", padx=(0, 10))
         self.log = ScrolledText(outer, height=18, wrap="word")
@@ -217,6 +220,13 @@ class SpiderApp:
         except OSError:
             subprocess.Popen(["notepad.exe", str(target)], cwd=str(APP_DIR))
 
+    def open_notice_folder(self) -> None:
+        folder = Path(self.xlsx.get().strip()).parent / "公告"
+        if not folder.exists():
+            messagebox.showinfo("公告文件夹", "尚未下载公告 PDF。")
+            return
+        os.startfile(folder)
+
     def clear_log(self) -> None:
         self.log.delete("1.0", "end")
 
@@ -224,7 +234,7 @@ class SpiderApp:
         self.log.insert("end", text)
         self.log.see("end")
         line = text.strip().splitlines()[-1] if text.strip() else ""
-        if line.startswith(("[列表]", "[详情]", "[写入]", "已生成", "已追加", "演练模式")):
+        if line.startswith(("[列表]", "[详情]", "[写入]", "[PDF]", "已生成", "已追加", "演练模式")):
             self.status.set(line[:160])
 
     def start(self) -> None:
@@ -245,6 +255,8 @@ class SpiderApp:
             cmd = [sys.executable, "-u", str(SPIDER), "--days", str(self.days.get()), "--xlsx", str(xlsx)]
         if self.dry_run.get():
             cmd.append("--dry-run")
+        if not self.download_pdf.get():
+            cmd.append("--no-download-pdf")
 
         self.run_button.config(state="disabled")
         self.stop_button.config(state="normal")

@@ -31,3 +31,6 @@ browser_data/
 02_源码和说明/build_*/
 02_源码和说明/dist_*/
 02_源码和说明/spec_*/
+
+# Downloaded business notices
+**/公告/

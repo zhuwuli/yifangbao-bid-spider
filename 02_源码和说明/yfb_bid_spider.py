@@ -15,13 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Font
-from openpyxl.worksheet.hyperlink import Hyperlink
 from requests.adapters import HTTPAdapter
 
 
@@ -47,11 +46,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_XLSX = SCRIPT_DIR / "2026-乙方宝招标信息统计.xlsx"
 DETAIL_SHEET_NAME = "公告详情"
 MAIN_SHEET_NAME = "Sheet1"
-MAIN_HEADERS = ("序号", "日期", "项目名称", "建设单位", "项目位置", "资质", "报名时间", "投标截止时间", "基本情况", "相关性", "备注")
+MAIN_HEADERS = (
+    "序号", "日期", "项目名称", "建设单位", "项目位置", "资质", "报名时间", "投标截止时间",
+    "基本情况", "相关性", "备注", "项目编号", "下载",
+)
+PROJECT_ID_COL = 12
+DOWNLOAD_COL = 13
+DETAIL_URL_COL = 14
+EXPORT_URL_COL = 15
+DETAIL_PROJECT_ID_COL = 6
+DETAIL_LINK_KEY_COL = 7
 QUALIFICATION_PLACEHOLDER = "公告资质"
 REMARK_PLACEHOLDER = "备注：未完整获取公告正文或未识别到明确资格要求，请人工核对。公告内容"
 LIST_WORKERS = 3
 DETAIL_WORKERS = 5
+PDF_WORKERS = 3
 MAX_LIST_PAGES = 30
 _HTTP_LOCAL = threading.local()
 
@@ -746,7 +755,7 @@ def fetch_details_with_retry(
     detail_results.sort(key=lambda result: result[0])
     return detail_results
 
-def row_from_item(item: dict[str, Any], detail: dict[str, Any]) -> list[Any]:
+def row_from_item(item: dict[str, Any], detail: dict[str, Any], openid: str) -> list[Any]:
     merged = {"list": item, "detail": detail}
     dt = parse_date(first_value(merged, ("publishDate", "releaseDate", "createTime", "addTime", "updateDate")))
     title = clean_html(first_value(merged, ("title", "projectName", "name")))
@@ -766,7 +775,20 @@ def row_from_item(item: dict[str, Any], detail: dict[str, Any]) -> list[Any]:
     qualification_text = extract_qualification(content, qualification)
     time_text = extract_signup_time(content, signup_time)
     deadline_text = extract_bid_deadline(content)
-    url = f"https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/{item.get('contentId')}/{item.get('areaId')}/zhaobiao"
+    content_id = str(item.get("contentId") or item.get("id") or "").strip()
+    area_id = str(item.get("areaId") or item.get("area") or "").strip()
+    detail_url = (
+        f"https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/"
+        f"{content_id}/{area_id}/zhaobiao?fromPage=searchPage&isFirstZhaobiao=false"
+        if content_id and area_id else ""
+    )
+    export_params = {"contentId": content_id}
+    if openid:
+        export_params["openid"] = openid
+    export_url = (
+        f"https://qiye.qianlima.com/new_qd_yfbsite/api/export/detail/pdf?{urlencode(export_params)}"
+        if content_id else ""
+    )
     return [
         None,
         dt.strftime("%m.%d") if dt else "",
@@ -778,7 +800,11 @@ def row_from_item(item: dict[str, Any], detail: dict[str, Any]) -> list[Any]:
         deadline_text,
         "",
         item.get("_relevanceLevel") or "明确相关",
-        url,
+        detail_url,
+        dt.strftime("%Y%m%d") if dt else datetime.now().strftime("%Y%m%d"),
+        "下载PDF" if export_url else "",
+        detail_url,
+        export_url,
     ]
 
 
@@ -798,6 +824,140 @@ def ensure_relevance_column(ws: Any) -> None:
         if src.alignment:
             dst.alignment = copy.copy(src.alignment)
 
+
+def project_date_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return text
+    match = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})", text)
+    if not match:
+        return datetime.now().strftime("%Y%m%d")
+    month, day = int(match.group(1)), int(match.group(2))
+    today = datetime.now()
+    try:
+        candidate = datetime(today.year, month, day)
+    except ValueError:
+        return today.strftime("%Y%m%d")
+    if candidate > today + timedelta(days=31):
+        candidate = candidate.replace(year=today.year - 1)
+    return candidate.strftime("%Y%m%d")
+
+
+def ensure_main_columns(ws: Any) -> None:
+    for col, header in enumerate(MAIN_HEADERS, start=1):
+        ws.cell(1, col, header)
+        ws.cell(1, col).font = Font(bold=True)
+    for row in range(1, ws.max_row + 1):
+        source = ws.cell(row, 10)
+        for col in (PROJECT_ID_COL, DOWNLOAD_COL):
+            target = ws.cell(row, col)
+            if source.has_style:
+                target._style = copy.copy(source._style)
+    ws.cell(1, DETAIL_URL_COL, "详情网址")
+    ws.cell(1, EXPORT_URL_COL, "导出网址")
+    ws.column_dimensions[ws.cell(1, PROJECT_ID_COL).column_letter].width = 22
+    ws.column_dimensions[ws.cell(1, DOWNLOAD_COL).column_letter].width = 12
+    ws.column_dimensions[ws.cell(1, DETAIL_URL_COL).column_letter].hidden = True
+    ws.column_dimensions[ws.cell(1, EXPORT_URL_COL).column_letter].hidden = True
+
+
+def ensure_project_ids(ws: Any) -> None:
+    ensure_main_columns(ws)
+    used_ids: set[str] = set()
+    next_number: dict[str, int] = {}
+    valid_pattern = re.compile(r"^YFB-(\d{8})-(\d{3,})$")
+    needs_id: list[tuple[int, str]] = []
+    for row in range(2, ws.max_row + 1):
+        if not str(ws.cell(row, 3).value or "").strip():
+            continue
+        raw_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+        match = valid_pattern.fullmatch(raw_id)
+        if match and raw_id not in used_ids:
+            date_key, number = match.group(1), int(match.group(2))
+            used_ids.add(raw_id)
+            next_number[date_key] = max(next_number.get(date_key, 1), number + 1)
+        else:
+            seed = raw_id if re.fullmatch(r"\d{8}", raw_id) else project_date_key(ws.cell(row, 2).value)
+            needs_id.append((row, seed))
+    for row, date_key in needs_id:
+        number = next_number.get(date_key, 1)
+        project_id = f"YFB-{date_key}-{number:03d}"
+        while project_id in used_ids:
+            number += 1
+            project_id = f"YFB-{date_key}-{number:03d}"
+        ws.cell(row, PROJECT_ID_COL).value = project_id
+        used_ids.add(project_id)
+        next_number[date_key] = number + 1
+
+
+def detail_url_from_text(text: str) -> str:
+    match = re.search(
+        r"https://qiye\.qianlima\.com/new_qd_yfbsite/#/infoCenter/infoDetail/[^\s<>\"]+",
+        str(text or ""),
+    )
+    return match.group(0).rstrip("。；;，,") if match else ""
+
+
+def export_url_from_detail_url(detail_url: str, openid: str) -> str:
+    match = re.search(r"/infoDetail/([^/?#]+)/([^/?#]+)/", detail_url)
+    if not match:
+        return ""
+    params = {"contentId": match.group(1)}
+    if openid:
+        params["openid"] = openid
+    return f"https://qiye.qianlima.com/new_qd_yfbsite/api/export/detail/pdf?{urlencode(params)}"
+
+
+def ensure_main_urls(ws: Any, detail_ws: Any | None, openid: str) -> None:
+    detail_urls: dict[str, str] = {}
+    if detail_ws is not None:
+        for row in range(2, detail_ws.max_row + 1):
+            title = str(detail_ws.cell(row, 2).value or "").strip()
+            found = detail_url_from_text(str(detail_ws.cell(row, 4).value or ""))
+            if title and found:
+                detail_urls.setdefault(title, found)
+    for row in range(2, ws.max_row + 1):
+        title = str(ws.cell(row, 3).value or "").strip()
+        if not title:
+            continue
+        detail_url = str(ws.cell(row, DETAIL_URL_COL).value or "").strip()
+        if not detail_url:
+            for cell in (ws.cell(row, 3), ws.cell(row, 11)):
+                target = str(cell.hyperlink.target or "") if cell.hyperlink else ""
+                if "/infoCenter/infoDetail/" in target:
+                    detail_url = target
+                    break
+        if not detail_url:
+            for cell in (ws.cell(row, 3), ws.cell(row, 11)):
+                detail_url = detail_url_from_text(str(cell.value or ""))
+                if detail_url:
+                    break
+        if not detail_url:
+            detail_url = detail_urls.get(title, "")
+        if detail_url:
+            ws.cell(row, DETAIL_URL_COL).value = detail_url
+            export_url = export_url_from_detail_url(detail_url, openid)
+            if export_url:
+                ws.cell(row, EXPORT_URL_COL).value = export_url
+
+
+def rebuild_external_links(ws: Any) -> None:
+    for row in range(2, ws.max_row + 1):
+        title_cell = ws.cell(row, 3)
+        detail_url = str(ws.cell(row, DETAIL_URL_COL).value or "").strip()
+        title_cell.hyperlink = None
+        if detail_url:
+            title_cell.hyperlink = detail_url
+            apply_hyperlink_font(title_cell)
+        download_cell = ws.cell(row, DOWNLOAD_COL)
+        export_url = str(ws.cell(row, EXPORT_URL_COL).value or "").strip()
+        download_cell.hyperlink = None
+        if export_url:
+            download_cell.value = "下载PDF"
+            download_cell.hyperlink = export_url
+            apply_hyperlink_font(download_cell)
+        else:
+            download_cell.value = ""
 
 def ensure_main_sheet(wb: Any) -> Any:
     ws = next(
@@ -826,6 +986,7 @@ def ensure_main_sheet(wb: Any) -> Any:
             ws.cell(1, col, header)
             ws.cell(1, col).font = Font(bold=True)
         ws.freeze_panes = "A2"
+    ensure_main_columns(ws)
     wb.active = wb.index(ws)
     return ws
 
@@ -835,16 +996,17 @@ def ensure_detail_sheet(wb: Any) -> Any:
         detail_ws = wb[DETAIL_SHEET_NAME]
     else:
         detail_ws = wb.create_sheet(DETAIL_SHEET_NAME)
-        detail_ws.append(["主表序号", "项目名称", "内容类型", "详细内容", "返回主表"])
-    headers = ["主表序号", "项目名称", "内容类型", "详细内容", "返回主表"]
+        detail_ws.append(["主表序号", "项目名称", "内容类型", "详细内容", "返回主表", "项目编号", "链接键"])
+    headers = ["主表序号", "项目名称", "内容类型", "详细内容", "返回主表", "项目编号", "链接键"]
     for col, header in enumerate(headers, start=1):
         detail_ws.cell(1, col, header)
         detail_ws.cell(1, col).font = Font(bold=True)
-    widths = {1: 12, 2: 70, 3: 16, 4: 120, 5: 18}
+    widths = {1: 12, 2: 70, 3: 16, 4: 120, 5: 18, 6: 22}
     for column, width in widths.items():
         letter = detail_ws.cell(1, column).column_letter
         detail_ws.column_dimensions[letter].width = width
     detail_ws.freeze_panes = "A2"
+    detail_ws.column_dimensions["G"].hidden = True
     trim_empty_tail(detail_ws, 2)
     return detail_ws
 
@@ -858,11 +1020,36 @@ def short_remark_label(text: str) -> str:
     return "公告备注"
 
 
-def set_internal_hyperlink(cell: Any, location: str, label: str | None = None) -> None:
-    if label is not None:
-        cell.value = label
-    cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
-    cell.style = "Hyperlink"
+def apply_hyperlink_font(cell: Any) -> None:
+    font = copy.copy(cell.font)
+    font.color = "0563C1"
+    font.underline = "single"
+    cell.font = font
+
+
+def set_dynamic_hyperlink(cell: Any, formula: str) -> None:
+    cell.hyperlink = None
+    cell.value = formula
+    apply_hyperlink_font(cell)
+
+
+def ensure_project_link_ids(ws: Any, detail_ws: Any) -> None:
+    ensure_project_ids(ws)
+    detail_ws.cell(1, DETAIL_PROJECT_ID_COL, "项目编号")
+    detail_ws.cell(1, DETAIL_LINK_KEY_COL, "链接键")
+    detail_ws.column_dimensions[detail_ws.cell(1, DETAIL_PROJECT_ID_COL).column_letter].width = 22
+    detail_ws.column_dimensions[detail_ws.cell(1, DETAIL_LINK_KEY_COL).column_letter].hidden = True
+    ids_by_title = {
+        str(ws.cell(row, 3).value or "").strip(): str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+        for row in range(2, ws.max_row + 1)
+        if str(ws.cell(row, 3).value or "").strip()
+    }
+    for row in range(2, detail_ws.max_row + 1):
+        title = str(detail_ws.cell(row, 2).value or "").strip()
+        kind = str(detail_ws.cell(row, 3).value or "").strip()
+        project_id = ids_by_title.get(title) or str(detail_ws.cell(row, DETAIL_PROJECT_ID_COL).value or "").strip()
+        detail_ws.cell(row, DETAIL_PROJECT_ID_COL).value = project_id
+        detail_ws.cell(row, DETAIL_LINK_KEY_COL).value = f"{project_id}|{kind}" if project_id and kind else ""
 
 
 def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kind: str, full_text: str, label: str) -> None:
@@ -875,8 +1062,10 @@ def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kin
     detail_ws.cell(detail_row, 2, title)
     detail_ws.cell(detail_row, 3, kind)
     detail_ws.cell(detail_row, 4, full_text)
-    back_cell = detail_ws.cell(detail_row, 5, "返回主表")
-    set_internal_hyperlink(back_cell, f"'{ws.title}'!{main_cell.coordinate}")
+    detail_ws.cell(detail_row, 5, "返回主表")
+    project_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+    detail_ws.cell(detail_row, DETAIL_PROJECT_ID_COL, project_id)
+    detail_ws.cell(detail_row, DETAIL_LINK_KEY_COL, f"{project_id}|{kind}" if project_id else "")
     for c in range(1, 6):
         cell = detail_ws.cell(detail_row, c)
         alignment = copy.copy(cell.alignment)
@@ -884,7 +1073,7 @@ def add_detail_link(ws: Any, detail_ws: Any, row: int, col: int, title: str, kin
         alignment.vertical = "top"
         cell.alignment = alignment
     detail_ws.row_dimensions[detail_row].height = min(409, max(45, len(full_text) // 80 * 15))
-    set_internal_hyperlink(main_cell, f"'{DETAIL_SHEET_NAME}'!D{detail_row}", label)
+    main_cell.value = label
     alignment = copy.copy(main_cell.alignment)
     alignment.wrap_text = True
     alignment.vertical = "top"
@@ -902,7 +1091,7 @@ def move_long_text_to_detail(ws: Any, detail_ws: Any, row: int) -> None:
 
 
 def format_notice_rows(ws: Any, row_numbers: list[int]) -> None:
-    widths = {1: 9, 2: 13, 3: 62, 4: 37, 5: 18, 6: 60, 7: 34, 8: 30, 9: 30, 10: 14, 11: 55}
+    widths = {1: 9, 2: 13, 3: 62, 4: 37, 5: 18, 6: 60, 7: 34, 8: 30, 9: 30, 10: 14, 11: 55, 12: 22, 13: 12}
     line_widths = {3: 45, 4: 27, 5: 16, 6: 60, 7: 30, 8: 26, 9: 30, 10: 10, 11: 55}
     for column, width in widths.items():
         letter = ws.cell(1, column).column_letter
@@ -910,7 +1099,7 @@ def format_notice_rows(ws: Any, row_numbers: list[int]) -> None:
         ws.column_dimensions[letter].width = max(current, width)
     for row in row_numbers:
         estimated_lines = 1
-        for column in range(1, 12):
+        for column in range(1, DOWNLOAD_COL + 1):
             cell = ws.cell(row, column)
             alignment = copy.copy(cell.alignment)
             alignment.wrap_text = True
@@ -962,61 +1151,69 @@ def filter_decision(title: str, qualification: str, remark: str, detail_text: st
     return False, "未命中筛选规则"
 
 
-def rebuild_internal_links(wb: Any) -> None:
+def rebuild_internal_links(wb: Any, openid: str = "") -> None:
     ws = ensure_main_sheet(wb)
     detail_ws = wb[DETAIL_SHEET_NAME] if DETAIL_SHEET_NAME in wb.sheetnames else None
+    expand_date_merges(ws)
     for row in range(2, ws.max_row + 1):
         ws.cell(row, 1).value = row - 1
+    ensure_project_ids(ws)
+    ensure_main_urls(ws, detail_ws, openid)
+    rebuild_external_links(ws)
     if detail_ws is None:
         return
-    main_rows = {
-        str(ws.cell(row, 3).value or "").strip(): row
+    ensure_project_link_ids(ws, detail_ws)
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcMode = "auto"
+
+    main_sequences = {
+        str(ws.cell(row, PROJECT_ID_COL).value or "").strip(): ws.cell(row, 1).value
         for row in range(2, ws.max_row + 1)
-        if str(ws.cell(row, 3).value or "").strip()
+        if str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
     }
-    detail_rows: dict[tuple[str, str], int] = {}
+    detail_texts_by_id: dict[str, dict[str, str]] = {}
     for row in range(2, detail_ws.max_row + 1):
-        title = str(detail_ws.cell(row, 2).value or "").strip()
+        project_id = str(detail_ws.cell(row, DETAIL_PROJECT_ID_COL).value or "").strip()
         kind = str(detail_ws.cell(row, 3).value or "").strip()
-        if title and kind in ("资质", "备注"):
-            detail_rows.setdefault((title, kind), row)
+        if project_id and kind in ("资质", "备注"):
+            detail_texts_by_id.setdefault(project_id, {})[kind] = str(detail_ws.cell(row, 4).value or "")
+            detail_ws.cell(row, 1).value = main_sequences.get(project_id, "")
 
     for row in range(2, ws.max_row + 1):
-        title = str(ws.cell(row, 3).value or "").strip()
+        project_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+        detail_texts = detail_texts_by_id.get(project_id, {})
         qualification_cell = ws.cell(row, 6)
         remark_cell = ws.cell(row, 11)
         qualification_cell.hyperlink = None
         remark_cell.hyperlink = None
-        qualification_row = detail_rows.get((title, "资质"))
-        if qualification_row:
-            set_internal_hyperlink(
+        if "资质" in detail_texts:
+            set_dynamic_hyperlink(
                 qualification_cell,
-                f"'{DETAIL_SHEET_NAME}'!D{qualification_row}",
-                QUALIFICATION_PLACEHOLDER,
+                f'=IFERROR(HYPERLINK("#\'{DETAIL_SHEET_NAME}\'!D"&MATCH(INDEX($L:$L,ROW())&"|资质",\'{DETAIL_SHEET_NAME}\'!$G:$G,0),"{QUALIFICATION_PLACEHOLDER}"),"详情已删除")',
             )
-        remark_row = detail_rows.get((title, "备注"))
-        if remark_row:
-            remark_text = str(detail_ws.cell(remark_row, 4).value or "")
-            set_internal_hyperlink(
+        elif str(qualification_cell.value or "").startswith("=IFERROR(HYPERLINK"):
+            qualification_cell.value = "详情已删除"
+        if "备注" in detail_texts:
+            remark_label = short_remark_label(detail_texts["备注"]).replace('"', '""')
+            set_dynamic_hyperlink(
                 remark_cell,
-                f"'{DETAIL_SHEET_NAME}'!D{remark_row}",
-                short_remark_label(remark_text),
+                f'=IFERROR(HYPERLINK("#\'{DETAIL_SHEET_NAME}\'!D"&MATCH(INDEX($L:$L,ROW())&"|备注",\'{DETAIL_SHEET_NAME}\'!$G:$G,0),"{remark_label}"),"详情已删除")',
             )
+        elif str(remark_cell.value or "").startswith("=IFERROR(HYPERLINK"):
+            remark_cell.value = "详情已删除"
 
     for row in range(2, detail_ws.max_row + 1):
-        title = str(detail_ws.cell(row, 2).value or "").strip()
         kind = str(detail_ws.cell(row, 3).value or "").strip()
-        main_row = main_rows.get(title)
+        project_id = str(detail_ws.cell(row, DETAIL_PROJECT_ID_COL).value or "").strip()
         back_cell = detail_ws.cell(row, 5)
         back_cell.hyperlink = None
-        if main_row:
-            detail_ws.cell(row, 1).value = ws.cell(main_row, 1).value
-            main_col = 11 if kind == "备注" else 6
-            set_internal_hyperlink(
+        if project_id and kind in ("资质", "备注"):
+            set_dynamic_hyperlink(
                 back_cell,
-                f"'{ws.title}'!{ws.cell(main_row, main_col).coordinate}",
-                "返回主表",
+                f'=IFERROR(HYPERLINK("#\'{ws.title}\'!"&IF(INDEX($C:$C,ROW())="备注","K","F")&MATCH(INDEX($F:$F,ROW()),\'{ws.title}\'!$L:$L,0),"返回主表"),"主表项目已删除")',
             )
+    rebuild_external_links(ws)
 
 
 def trim_empty_tail(ws: Any, title_col: int) -> None:
@@ -1090,7 +1287,115 @@ def sort_main_sheet_by_date(ws: Any) -> None:
     trim_empty_tail(ws, 3)
     merge_equal_date_cells(ws)
 
-def create_filtered_workbook(path: Path) -> Path:
+def safe_pdf_filename(project_id: str, title: str) -> str:
+    clean_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", clean_html(title)).strip(" ._")
+    clean_title = re.sub(r"\s+", " ", clean_title)[:100] or "未命名公告"
+    return f"{project_id}_{clean_title}.pdf"
+
+
+def export_content_id(export_url: str) -> str:
+    try:
+        return str((parse_qs(urlparse(export_url).query).get("contentId") or [""])[0]).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def download_one_pdf(
+    project_id: str,
+    title: str,
+    export_url: str,
+    destination: Path,
+    headers: dict[str, str],
+    openid: str,
+) -> tuple[str, bool, str]:
+    content_id = export_content_id(export_url)
+    if not content_id:
+        return project_id, False, "导出地址缺少 contentId"
+    try:
+        permission = request_json(
+            "/export/checkExport",
+            {"contentId": content_id, "openid": openid or None},
+            headers,
+            timeout=20,
+        ).get("data") or {}
+        if isinstance(permission, dict) and permission.get("canExport") is False:
+            limit_num = permission.get("limitNum")
+            suffix = f"，剩余额度 {limit_num}" if limit_num not in (None, "") else ""
+            return project_id, False, f"账号无导出权限或今日额度不足{suffix}"
+        request_headers = dict(headers)
+        request_headers["Accept"] = "application/pdf,application/octet-stream,*/*"
+        response = http_session().get(export_url, headers=request_headers, timeout=90)
+        if response.status_code in (401, 403):
+            return project_id, False, f"导出请求被拒绝（HTTP {response.status_code}）"
+        response.raise_for_status()
+        content = response.content
+        if not content.startswith(b"%PDF-"):
+            try:
+                payload = response.json()
+                message = payload.get("msg") or payload.get("message") or str(payload)[:200]
+            except (ValueError, AttributeError):
+                message = f"返回内容不是 PDF（{response.headers.get('Content-Type', '未知类型')}）"
+            return project_id, False, message
+        destination.mkdir(parents=True, exist_ok=True)
+        output = destination / safe_pdf_filename(project_id, title)
+        output.write_bytes(content)
+        return project_id, True, str(output)
+    except YfbAuthError as exc:
+        return project_id, False, f"登录状态失效：{exc}"
+    except Exception as exc:
+        return project_id, False, str(exc)
+
+
+def download_filtered_pdfs(
+    filtered_path: Path,
+    project_ids: set[str],
+    headers: dict[str, str],
+    openid: str,
+) -> None:
+    if not project_ids:
+        print("[PDF] 本次没有新增且通过筛选的项目，无需下载公告", flush=True)
+        return
+    wb = load_workbook(filtered_path, read_only=True, data_only=False)
+    ws = wb[MAIN_SHEET_NAME] if MAIN_SHEET_NAME in wb.sheetnames else wb.active
+    candidates: list[tuple[str, str, str]] = []
+    for row in range(2, ws.max_row + 1):
+        project_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+        export_url = str(ws.cell(row, EXPORT_URL_COL).value or "").strip()
+        if project_id in project_ids and export_url:
+            candidates.append((project_id, str(ws.cell(row, 3).value or "").strip(), export_url))
+    wb.close()
+    if not candidates:
+        print("[PDF] 本次新增项目均未进入筛选后表，无需下载公告", flush=True)
+        return
+    destination = filtered_path.parent / "公告" / datetime.now().strftime("%Y%m%d")
+    print(f"[PDF] 开始下载筛选后公告：{len(candidates)} 条，保存到 {destination}", flush=True)
+    succeeded = 0
+    failed = 0
+    workers = min(PDF_WORKERS, len(candidates))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yfb-pdf") as executor:
+        future_map = {
+            executor.submit(download_one_pdf, project_id, title, export_url, destination, headers, openid): title
+            for project_id, title, export_url in candidates
+        }
+        for completed, future in enumerate(as_completed(future_map), start=1):
+            title = future_map[future]
+            project_id, ok, message = future.result()
+            if ok:
+                succeeded += 1
+                status = f"完成：{message}"
+            else:
+                failed += 1
+                status = f"失败：{message}"
+            print(f"[PDF] {completed}/{len(candidates)} {project_id} {title[:60]}；{status}", flush=True)
+    print(f"[PDF] 下载结束：成功 {succeeded} 条，失败 {failed} 条", flush=True)
+
+def create_filtered_workbook(
+    path: Path,
+    new_project_ids: set[str] | None = None,
+    headers: dict[str, str] | None = None,
+    openid: str = "",
+    download_pdfs: bool = False,
+) -> Path:
     output = filtered_output_path(path)
     if output.exists():
         try:
@@ -1101,67 +1406,84 @@ def create_filtered_workbook(path: Path) -> Path:
     wb = load_workbook(output)
     ws = ensure_main_sheet(wb)
     detail_ws = wb[DETAIL_SHEET_NAME] if DETAIL_SHEET_NAME in wb.sheetnames else None
-    details = detail_texts_by_title(detail_ws)
     expand_date_merges(ws)
+    ensure_project_ids(ws)
+    ensure_main_urls(ws, detail_ws, openid)
+    if detail_ws is not None:
+        ensure_project_link_ids(ws, detail_ws)
+    details = detail_texts_by_title(detail_ws)
     deleted_sheet_name = "筛选删除记录"
     if deleted_sheet_name in wb.sheetnames:
         del wb[deleted_sheet_name]
     deleted_ws = wb.create_sheet(deleted_sheet_name)
-    headers = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
-    deleted_ws.append(headers + ["筛出原因"])
+    column_headers = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
+    deleted_ws.append(column_headers + ["筛出原因"])
     remove_titles: set[str] = set()
+    remove_ids: set[str] = set()
     removed = 0
     kept = 0
     for row in range(2, ws.max_row + 1):
         title = str(ws.cell(row, 3).value or "").strip()
         if not title:
             continue
+        project_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
         qualification = str(ws.cell(row, 6).value or "")
-        remark = str(ws.cell(row, 11).value or "") if ws.max_column >= 11 else ""
+        remark = str(ws.cell(row, 11).value or "")
         keep, reason = filter_decision(title, qualification, remark, details.get(title, ""))
         if keep:
             kept += 1
-            if ws.max_column >= 10:
-                ws.cell(row, 10).value = reason
+            ws.cell(row, 10).value = reason
         else:
             remove_titles.add(title)
+            if project_id:
+                remove_ids.add(project_id)
             deleted_ws.append([ws.cell(row, col).value for col in range(1, ws.max_column + 1)] + [reason])
     for row in range(ws.max_row, 1, -1):
         title = str(ws.cell(row, 3).value or "").strip()
-        if not title or title in remove_titles:
+        project_id = str(ws.cell(row, PROJECT_ID_COL).value or "").strip()
+        if not title or project_id in remove_ids or title in remove_titles:
             ws.delete_rows(row, 1)
             if title:
                 removed += 1
     if detail_ws is not None:
         for row in range(detail_ws.max_row, 1, -1):
             title = str(detail_ws.cell(row, 2).value or "").strip()
-            if not title or title in remove_titles:
+            project_id = str(detail_ws.cell(row, DETAIL_PROJECT_ID_COL).value or "").strip()
+            if not title or project_id in remove_ids or title in remove_titles:
                 detail_ws.delete_rows(row, 1)
         trim_empty_tail(detail_ws, 2)
     trim_empty_tail(ws, 3)
     trim_empty_tail(deleted_ws, 3)
     merge_equal_date_cells(ws)
     for col in range(1, deleted_ws.max_column + 1):
-        deleted_ws.column_dimensions[deleted_ws.cell(1, col).column_letter].width = min(60, max(12, len(str(deleted_ws.cell(1, col).value or "")) + 4))
-    rebuild_internal_links(wb)
+        deleted_ws.column_dimensions[deleted_ws.cell(1, col).column_letter].width = min(
+            60, max(12, len(str(deleted_ws.cell(1, col).value or "")) + 4)
+        )
+    rebuild_internal_links(wb, openid)
     wb.save(output)
     print(f"已生成筛选后文件：{output}（保留 {kept} 条，删除 {removed} 条；删除记录见《{deleted_sheet_name}》）")
+    kept_new_ids = set(new_project_ids or set()) - remove_ids
+    if download_pdfs and headers is not None:
+        download_filtered_pdfs(output, kept_new_ids, headers, openid)
     return output
 
-
-def append_to_workbook(path: Path, rows: list[list[Any]], dry_run: bool) -> None:
-    if not rows:
-        print("未抓到符合条件的新数据，原始 Excel 未修改。")
-        if not dry_run and path.exists():
-            create_filtered_workbook(path)
-        return
+def append_to_workbook(
+    path: Path,
+    rows: list[list[Any]],
+    dry_run: bool,
+    headers: dict[str, str],
+    openid: str,
+    download_pdfs: bool,
+) -> None:
     wb = load_workbook(path)
     ws = ensure_main_sheet(wb)
+    layout_upgrade = ws.cell(1, PROJECT_ID_COL).value != "项目编号" or ws.cell(1, DOWNLOAD_COL).value != "下载"
     ensure_relevance_column(ws)
     detail_ws = ensure_detail_sheet(wb)
-    # Expand date merges before deleting trailing rows so a merge cannot be
-    # partially removed and leave openpyxl with stale merged-cell metadata.
     expand_date_merges(ws)
+    ensure_project_ids(ws)
+    ensure_main_urls(ws, detail_ws, openid)
+    ensure_project_link_ids(ws, detail_ws)
     while ws.max_row > 2 and all(ws.cell(ws.max_row, c).value in (None, "") for c in range(1, ws.max_column + 1)):
         ws.delete_rows(ws.max_row)
     existing_titles = {
@@ -1169,7 +1491,7 @@ def append_to_workbook(path: Path, rows: list[list[Any]], dry_run: bool) -> None
         for r in range(2, ws.max_row + 1)
         if str(ws.cell(r, 3).value or "").strip()
     }
-    filtered_rows = []
+    filtered_rows: list[list[Any]] = []
     seen_new_titles: set[str] = set()
     for row in rows:
         title_key = normalize_title_for_dedupe(str(row[2] or ""))
@@ -1179,44 +1501,56 @@ def append_to_workbook(path: Path, rows: list[list[Any]], dry_run: bool) -> None
         if title_key:
             seen_new_titles.add(title_key)
     rows = filtered_rows
-    if not rows:
-        print("抓到的数据均已存在，原始 Excel 未修改。")
-        if not dry_run and path.exists():
-            create_filtered_workbook(path)
-        return
-    rows.sort(key=lambda row: worksheet_date_sort_key(row[1] if len(row) > 1 else ""))
-    template_row = ws.max_row == 2 and all(
-        ws.cell(2, c).value in (None, "") for c in range(1, ws.max_column + 1)
-    )
-    start = 2 if template_row else ws.max_row + 1
-    last_no = max([ws.cell(r, 1).value for r in range(2, ws.max_row + 1) if isinstance(ws.cell(r, 1).value, int)] or [0])
-    style_row = 2 if template_row else ws.max_row
-    for offset, row in enumerate(rows, start=0):
-        target = start + offset
-        row[0] = last_no + offset + 1
-        for col, value in enumerate(row, start=1):
-            cell = ws.cell(target, col, value)
-            src = ws.cell(style_row, col)
-            if src.has_style:
-                cell._style = copy.copy(src._style)
-            if src.number_format:
-                cell.number_format = src.number_format
-            if src.alignment:
-                cell.alignment = copy.copy(src.alignment)
-        move_long_text_to_detail(ws, detail_ws, target)
-    format_notice_rows(ws, list(range(start, start + len(rows))))
-    sort_main_sheet_by_date(ws)
-    format_notice_rows(ws, list(range(2, ws.max_row + 1)))
-    rebuild_internal_links(wb)
+    new_project_ids: set[str] = set()
+    if rows:
+        rows.sort(key=lambda row: worksheet_date_sort_key(row[1] if len(row) > 1 else ""))
+        # Some distributed templates prefill only A2 with serial number 1.
+        # Treat that row as empty so the first project still starts on row 2.
+        template_row = ws.max_row == 2 and all(
+            ws.cell(2, c).value in (None, "") for c in range(2, ws.max_column + 1)
+        )
+        start = 2 if template_row else ws.max_row + 1
+        last_no = max(
+            [ws.cell(r, 1).value for r in range(2, ws.max_row + 1) if isinstance(ws.cell(r, 1).value, int)] or [0]
+        )
+        style_row = 2 if template_row else ws.max_row
+        for offset, row in enumerate(rows):
+            target = start + offset
+            row[0] = last_no + offset + 1
+            for col, value in enumerate(row, start=1):
+                cell = ws.cell(target, col, value)
+                src = ws.cell(style_row, col if col <= 11 else 10)
+                if src.has_style:
+                    cell._style = copy.copy(src._style)
+                if src.number_format:
+                    cell.number_format = src.number_format
+                if src.alignment:
+                    cell.alignment = copy.copy(src.alignment)
+        ensure_project_ids(ws)
+        for target in range(start, start + len(rows)):
+            new_project_ids.add(str(ws.cell(target, PROJECT_ID_COL).value or "").strip())
+            move_long_text_to_detail(ws, detail_ws, target)
+        format_notice_rows(ws, list(range(start, start + len(rows))))
+        sort_main_sheet_by_date(ws)
+        format_notice_rows(ws, list(range(2, ws.max_row + 1)))
+    rebuild_internal_links(wb, openid)
     if dry_run:
-        print(f"演练模式：将追加 {len(rows)} 条，Excel 未修改。")
+        print(f"演练模式：将追加 {len(rows)} 条，Excel 和公告 PDF 均未修改。")
+        return
+    if not rows:
+        print("未抓到新项目或抓到的数据均已存在，原始 Excel 没有新增数据。")
+        if layout_upgrade:
+            backup = path.with_suffix(f".backup-{datetime.now():%Y%m%d-%H%M%S}.xlsx")
+            shutil.copy2(path, backup)
+            wb.save(path)
+            print(f"已自动升级 Excel 链接结构，备份文件：{backup}")
+        create_filtered_workbook(path, set(), headers, openid, False)
         return
     backup = path.with_suffix(f".backup-{datetime.now():%Y%m%d-%H%M%S}.xlsx")
     shutil.copy2(path, backup)
     wb.save(path)
     print(f"已追加 {len(rows)} 条，备份文件：{backup}")
-    create_filtered_workbook(path)
-
+    create_filtered_workbook(path, new_project_ids, headers, openid, download_pdfs)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="搜索乙方宝近 N 天山东济南/莱芜监测、水土保持、测绘、测量、绿色建筑招标并追加到 Excel，并生成筛选后文件")
@@ -1226,6 +1560,7 @@ def main() -> int:
     parser.add_argument("--cookie", default="")
     parser.add_argument("--openid", default=os.getenv("YFB_OPENID", ""))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-download-pdf", action="store_true", help="不自动下载筛选后新增公告 PDF")
     args = parser.parse_args()
 
     headers = build_headers(args)
@@ -1265,7 +1600,7 @@ def main() -> int:
             if not level:
                 level = "待终筛"
             item["_relevanceLevel"] = level
-            row = row_from_item(item, detail)
+            row = row_from_item(item, detail, openid)
             remark_parts = []
             if item.get("_detailFetchError"):
                 remark_parts.append("备注：乙方宝详情接口并发抓取和串行补抓均失败，当前仅保留列表信息，请点击原公告人工核对。")
@@ -1281,7 +1616,7 @@ def main() -> int:
                 row[10] = "\n".join(remark_parts) + "\n链接：" + str(row[10] or "")
             rows.append(row)
         print(f"[写入] 详情解析完成：准备写入 {len(rows)} 条新数据，跳过已有 {skipped_existing} 条", flush=True)
-        append_to_workbook(args.xlsx, rows, args.dry_run)
+        append_to_workbook(args.xlsx, rows, args.dry_run, headers, openid, not args.no_download_pdf)
     except YfbAuthError as exc:
         print(f"认证失败：{exc}", file=sys.stderr)
         print("请登录乙方宝后提供 YFB_TOKEN，或设置 YFB_COOKIE / YFB_OPENID 再运行。", file=sys.stderr)
